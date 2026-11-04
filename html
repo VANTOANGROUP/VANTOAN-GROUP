@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Traffic AI Control</title>
+<style>
+:root{
+ --bg:#0b1220;--panel:#172235;--border:#29384f;
+ --text:#f1f5f9;--muted:#94a3b8;--blue:#38bdf8;
+ --green:#4ade80;--red:#fb7185;--orange:#fbbf24
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:18px 24px;border-bottom:1px solid var(--border);background:#111b2c}
+h1{font-size:20px;margin:0}
+h2{font-size:16px;margin:0 0 14px}
+.muted,small{color:var(--muted)}
+main{max-width:1600px;margin:auto;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;min-width:0}
+.metric strong{font-size:30px;display:block;margin-top:8px}
+.metric small{font-size:12px}
+.blue{color:var(--blue)}.green{color:var(--green)}
+.red{color:var(--red)}.orange{color:var(--orange)}
+.camera-head{display:flex;justify-content:space-between;margin-bottom:12px}
+.view{position:relative;background:#000;border-radius:8px;overflow:hidden}
+.view img{width:100%;display:block;aspect-ratio:4/3;object-fit:contain}
+.view canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+.field{display:flex;flex-direction:column;gap:6px}
+label{font-size:12px;color:var(--muted)}
+select,input,button{padding:10px;border-radius:7px;border:1px solid var(--border);background:#0e1726;color:white}
+button{cursor:pointer;background:#2563eb;border-color:#2563eb}
+button.secondary{background:#26354a;border-color:#35465c}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--border)}
+.row:last-child{border-bottom:0}
+.progress{height:7px;background:#334155;border-radius:10px;overflow:hidden;margin-top:8px}
+.bar{height:100%;background:var(--blue)}
+.density-light-grid{margin-top:16px;align-items:stretch}
+.lights-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.lights-head h2{margin:0}
+.lights-note{font-size:12px;color:var(--muted)}
+.traffic-lights{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding-top:6px}
+.traffic-direction{min-width:0;text-align:center}
+.traffic-direction h3{font-size:14px;margin:0 0 12px}
+.signal-housing{width:58px;margin:0 auto;padding:10px;display:flex;flex-direction:column;align-items:center;gap:9px;background:#0b1220;border:1px solid #334155;border-radius:16px;box-shadow:inset 0 2px 6px #0005}
+.signal-bulb{display:block;width:30px;height:30px;border-radius:50%;border:1px solid #334155;background:#243044}
+.signal-bulb.is-red{background:#fb7185;border-color:#fda4af;box-shadow:0 0 16px #fb718570}
+.signal-bulb.is-yellow{background:#fbbf24;border-color:#fde68a;box-shadow:0 0 16px #fbbf2470}
+.signal-bulb.is-green{background:#4ade80;border-color:#86efac;box-shadow:0 0 16px #4ade8070}
+.signal-countdown{margin-top:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.signal-countdown strong{font-size:30px;line-height:1.2}
+.signal-countdown span{font-size:13px;color:var(--muted);margin-left:4px}
+.signal-state{font-size:12px;color:var(--muted);margin-top:5px;min-height:32px}
+.traffic-direction[data-color="red"] .signal-countdown strong,.traffic-direction[data-color="red"] .signal-state{color:var(--red)}
+.traffic-direction[data-color="yellow"] .signal-countdown strong,.traffic-direction[data-color="yellow"] .signal-state{color:var(--orange)}
+.traffic-direction[data-color="green"] .signal-countdown strong,.traffic-direction[data-color="green"] .signal-state{color:var(--green)}
+.tag{padding:4px 9px;border-radius:20px;background:#24354a;font-size:12px}
+.alert-banner{display:none;background:#7f1d1d;border:1px solid #ef4444;border-radius:10px;padding:15px;margin-bottom:16px;color:white;font-weight:bold;font-size:18px;text-align:center}
+.alert-banner.active{display:block}
+.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}
+.event{background:#111b2c;border:1px solid var(--border);border-radius:9px;overflow:hidden}
+.event img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block}
+.event-info{padding:12px;line-height:1.8}
+.event-info b{color:var(--orange)}
+.event-info small{display:block}
+.event a{color:var(--blue);text-decoration:none}
+#message{color:var(--green);font-size:13px}
+@media(max-width:850px){
+ .grid{grid-template-columns:1fr}
+ .metrics{grid-template-columns:repeat(2,1fr)}
+ header{padding:14px}
+ main{padding:12px}
+}
+@media(max-width:480px){
+ .traffic-lights{gap:6px}
+ .signal-housing{width:50px;padding:8px;gap:8px}
+ .signal-bulb{width:27px;height:27px}
+ .signal-countdown strong{font-size:26px}
+}
+</style>
+</head>
+<body>
+<header>
+ <div>
+  <h1>🚦 TRAFFIC AI CONTROL</h1>
+  <small>Smart Intersection Monitoring System</small>
+ </div>
+ <span class="tag" id="systemState">● Starting</span>
+</header>
+
+<main>
+<div id="alertBanner" class="alert-banner">
+ ⚠️ CẢNH BÁO: PHÁT HIỆN BÁNH XE ĐÈ VẠCH!
+</div>
+
+<section class="metrics">
+ <div class="card metric">
+  <small>TỔNG XE</small>
+  <strong class="blue" id="totalVehicles">0</strong>
+ </div>
+ <div class="card metric">
+  <small>CAMERA ONLINE</small>
+  <strong class="orange" id="onlineCameras">0/2</strong>
+ </div>
+</section>
+
+<section class="grid">
+ <div class="card">
+  <div class="camera-head">
+   <b>Camera 0</b>
+   <span class="tag" id="state0">Connecting</span>
+  </div>
+  <div class="view">
+   <img src="/video/0" alt="Camera 0">
+   <canvas id="canvas0"></canvas>
+  </div>
+ </div>
+ <div class="card">
+  <div class="camera-head">
+   <b>Camera 2</b>
+   <span class="tag" id="state2">Connecting</span>
+  </div>
+  <div class="view">
+   <img src="/video/2" alt="Camera 2">
+   <canvas id="canvas2"></canvas>
+  </div>
+ </div>
+</section>
+<section class="card" style="margin-top:16px">
+ <h2>⚙️ Thiết lập vùng và vạch</h2>
+ <div class="controls">
+  <div class="field">
+   <label>Camera</label>
+   <select id="camera">
+    <option value="0">Camera 0</option>
+    <option value="2">Camera 2</option>
+   </select>
+  </div>
+  <div class="field">
+   <label>Loại thiết lập</label>
+   <select id="mode">
+    <option value="zones">Vùng mật độ</option>
+     <option value="parking_zones">Vùng cấm đậu xe</option>
+    <option value="lines">Vạch kẻ đường</option>
+     <option value="red_lines">Vạch dừng đèn đỏ</option>
+   </select>
+  </div>
+  <div class="field">
+   <label id="numberLabel">Hướng</label>
+   <select id="number">
+    <option value="1">Bắc</option>
+    <option value="2">Nam</option>
+    <option value="3">Đông</option>
+    <option value="4">Tây</option>
+   </select>
+  </div>
+  <div class="field">
+   <label>Độ rộng vạch (px)</label>
+   <input id="lineWidth" type="number"
+          value="14" min="2" max="100"
+          style="width:90px">
+  </div>
+ </div>
+ <div class="controls" style="margin-top:14px">
+  <button class="secondary" onclick="undo()">↶ Xóa điểm cuối</button>
+  <button class="secondary" onclick="clearPoints()">Vẽ lại</button>
+  <button onclick="saveSelection()">💾 Lưu thiết lập</button>
+  <span id="message"></span>
+ </div>
+ <p class="muted" style="font-size:13px">
+  Vùng mật độ: chọn ít nhất 3 điểm.
+  Vạch kẻ đường: chọn đúng 2 điểm.
+  Nhấn vào video để đánh dấu.
+ </p>
+</section>
+
+<section class="grid density-light-grid">
+ <div class="card">
+  <h2>📊 Mật độ giao thông</h2>
+  <div id="zoneStats"></div>
+ </div>
+ <div class="card">
+  <div class="lights-head">
+   <h2>🚦 Trạng thái đèn</h2>
+   <span id="lightStatus" class="lights-note">Chưa có dữ liệu đèn</span>
+  </div>
+  <div id="lightStats" class="traffic-lights"></div>
+   <div style="margin:12px 0;padding:12px;border:1px solid #35465c;border-radius:8px">
+   <b><span id="espLed" style="color:#fb7185">●</span> ESP32: <span id="espStatus">Chưa kết nối</span></b>
+   <div class="controls" style="margin-top:10px">
+   <button onclick="espPing()"> Kết nối</button>
+   </div>
+   <small id="espMessage" style="display:none">Chờ ESP32</small>
+  </div>
+  <p id="fuzzyInfo" class="lights-note" style="margin-top:14px">Đang chờ bộ điều khiển Fuzzy...</p>
+ </div>
+</section>
+
+<section class="card" style="margin-top:16px">
+ <h2>📸 Lịch sử cảnh báo và hình ảnh</h2>
+ <div class="controls" style="margin-bottom:12px">
+  <span id="eventCount" class="muted">Đang tải...</span>
+ 
+  <button class="secondary" onclick="clearOldEvents()">
+ Xóa lịch sử và ảnh cũ
+</button>
+ </div>
+ <div class="events" id="eventList"></div>
+</section>
+
+
+<footer class="muted" style="padding:20px 0;font-size:12px">
+ Traffic AI · Raspberry Pi · YOLO NCNN
+ <span id="modelName"></span>
+</footer>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const ZONE_NAMES = {
+ 1: 'Bắc',
+ 2: 'Nam',
+ 3: 'Đông',
+ 4: 'Tây'
+};
+let cfg = null, points = [];
+const camera = $('camera');
+const mode = $('mode');
+const number = $('number');
+
+function updateNumberLabels(){
+ const isZone = mode.value === 'zones';
+ $('numberLabel').textContent = isZone ? 'Hướng' : (mode.value === 'red_lines' ? 'Hướng đèn đỏ' : 'Vạch');
+ for(const option of number.options){
+  const id = Number(option.value);
+  option.textContent = (isZone || mode.value === 'red_lines') ? ZONE_NAMES[id] : 'Vạch ' + id;
+ }
+}
+
+function selected(){
+ return cfg
+  ? cfg[mode.value].find(x=>x.id===+number.value)
+  : null;
+}
+
+function loadSelection(){
+ const item = selected();
+ points = item && item.camera===+camera.value
+  ? item.points.map(p=>[...p]) : [];
+ if(item && ['lines','red_lines'].includes(mode.value))
+  $('lineWidth').value=item.width||14;
+ draw();
+}
+
+function draw(){
+ for(const id of [0,2]){
+  const c=$('canvas'+id);
+  c.width=c.clientWidth;
+  c.height=c.clientHeight;
+  c.getContext('2d').clearRect(0,0,c.width,c.height);
+ }
+ const c=$('canvas'+camera.value);
+ const ctx=c.getContext('2d');
+ if(!points.length)return;
+
+ ctx.strokeStyle=mode.value==='zones'
+  ? '#f97316' : mode.value==='red_lines' ? '#fb7185' : '#22d3ee';
+ ctx.fillStyle=ctx.strokeStyle;
+ ctx.lineWidth=3;
+ ctx.beginPath();
+
+ points.forEach((p,i)=>{
+  const x=p[0]*c.width,y=p[1]*c.height;
+  if(i===0)ctx.moveTo(x,y);
+  else ctx.lineTo(x,y);
+ });
+ if(mode.value==='zones'&&points.length>=3)
+  ctx.closePath();
+ ctx.stroke();
+
+ points.forEach(p=>{
+  ctx.beginPath();
+  ctx.arc(p[0]*c.width,p[1]*c.height,5,0,Math.PI*2);
+  ctx.fill();
+ });
+}
+
+for(const id of [0,2]){
+ $('canvas'+id).addEventListener('click',e=>{
+  if(+camera.value!==id){
+   $('message').textContent='Hãy chọn Camera '+id;
+   return;
+  }
+  if(['lines','red_lines'].includes(mode.value)&&points.length>=2)return;
+  const r=e.target.getBoundingClientRect();
+  points.push([
+   (e.clientX-r.left)/r.width,
+   (e.clientY-r.top)/r.height
+  ]);
+  draw();
+ });
+}
+
+function undo(){points.pop();draw();}
+function clearPoints(){points=[];draw();}
+
+async function reload(){
+ cfg=await(await fetch('/api/config')).json();
+ loadSelection();
+}
+
+async function saveSelection(){
+ const isLine=['lines','red_lines'].includes(mode.value);
+ const needed=isLine?2:3;
+ if(points.length<needed||
+    (isLine&&points.length!==2)){
+  $('message').textContent='Chưa đủ số điểm hợp lệ';
+  return;
+ }
+ try{
+  const response=await fetch(
+   `/api/config/${mode.value}/${number.value}`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+     camera:+camera.value,
+     points,
+     width:+$('lineWidth').value
+    })
+   }
+  );
+  const data=await response.json();
+  $('message').textContent=response.ok
+   ? 'Đã lưu thành công'
+   : (data.error||'Lỗi lưu');
+  if(response.ok)await reload();
+ }catch(e){
+  $('message').textContent='Không kết nối được máy chủ';
+ }
+}
+
+camera.onchange=loadSelection;
+mode.onchange=()=>{
+ updateNumberLabels();
+ loadSelection();
+};
+number.onchange=loadSelection;
+window.onresize=draw;
+updateNumberLabels();
+
+function cardRow(name,count,percent,detail){
+ return `<div class="row">
+  <div style="flex:1">
+   <div><b>${name}</b>
+    <span class="muted" style="font-size:12px">${detail}</span>
+   </div>
+   <div class="progress">
+    <div class="bar" style="width:${percent}%"></div>
+   </div>
+  </div>
+  <strong>${count}</strong>
+ </div>`;
+}
+
+let lastLightsUpdate = 0;
+
+// /api/status.lights uses direction IDs: 1=Bac, 2=Nam, 3=Dong, 4=Tay.
+// Each item: {color: 'red'|'yellow'|'green', remaining: seconds_until_change}.
+// Only display the remaining time supplied by the controller.
+function renderTrafficLights(lights, disconnected=false){
+ const colorNames={red:'Đỏ',yellow:'Vàng',green:'Xanh'};
+ let available=0;
+ lastLightsUpdate=Date.now();
+
+ $('lightStats').innerHTML=[1,2,3,4].map(id=>{
+  const state=lights && typeof lights==='object' ? lights[id] : null;
+  const rawColor=typeof state?.color==='string'
+   ? state.color.trim().toLowerCase() : '';
+  const color=['red','yellow','green'].includes(rawColor)
+   ? rawColor : 'unknown';
+  const hasColor=color!=='unknown';
+  if(hasColor)available++;
+
+  const value=state?.remaining;
+  const seconds=hasColor && typeof value==='number'
+   && Number.isFinite(value) && value>=0 ? Math.ceil(value) : '—';
+  const label=hasColor ? 'Đèn '+colorNames[color] : 'Chưa có dữ liệu';
+
+  return `<article class="traffic-direction" data-direction="${id}" data-color="${color}">
+   <h3>${ZONE_NAMES[id]}</h3>
+   <div class="signal-housing" role="img" aria-label="${ZONE_NAMES[id]}: ${label}">
+    ${['red','yellow','green'].map(c=>
+     `<span aria-hidden="true" class="signal-bulb${c===color?' is-'+c:''}"></span>`
+    ).join('')}
+   </div>
+   <div class="signal-countdown" aria-label="Thời gian còn lại: ${seconds==='—'?'chưa có dữ liệu':seconds+' giây'}">
+    <strong>${seconds}</strong><span>s</span>
+   </div>
+   <div class="signal-state">${label}</div>
+  </article>`;
+ }).join('');
+
+ $('lightStatus').textContent=disconnected ? 'Mất kết nối dữ liệu đèn'
+  : available===4 ? 'Cập nhật trực tiếp'
+  : available>0 ? 'Đang chờ đủ bốn hướng' : 'Chưa có dữ liệu đèn';
+}
+
+async function refresh(){
+ try{
+  const response=await fetch('/api/status',{cache:'no-store'});
+  if(!response.ok)throw new Error('Không tải được trạng thái');
+  const data=await response.json();
+  renderTrafficLights(data.lights);
+  const control=data.light_control||{};
+  const phaseLabels={GREEN:'Xanh',YELLOW:'Vàng',ALL_RED:'Tất cả đỏ'};
+  $('fuzzyInfo').textContent=`Chế độ: ${control.mode||'—'} · Pha: ${phaseLabels[control.phase]||'—'} · Đang cấp: ${control.active||'Không'} · Xanh dự đoán BN: ${control.planned_green?.NS??'—'}s, ĐT: ${control.planned_green?.EW??'—'}s · Ký tự dự kiến: ${control.command||'R'} · ${control.reason||''}`;
+  const cams=data.cameras||{};
+  const a=cams['0']||{},b=cams['2']||{};
+  const arr=[a,b];
+  const sum=k=>arr.reduce((n,x)=>n+(x[k]||0),0);
+
+  $('totalVehicles').textContent=sum('vehicles');
+
+  $('alertBanner').classList.toggle(
+   'active',arr.some(x=>x.line_alert===true)
+  );
+
+  const online=arr.filter(x=>x.status==='Online').length;
+  $('onlineCameras').textContent=online+'/2';
+  $('systemState').textContent=online===2
+   ? '● Cameras online' : '● Checking cameras';
+  $('state0').textContent=a.status||'Starting';
+  $('state2').textContent=b.status||'Starting';
+
+  const zoneMap={};
+  for(const s of arr){
+   for(const [id,n] of Object.entries(s.zones||{})) zoneMap[id]=(zoneMap[id]||0)+Number(n||0);
+  }
+
+  $('zoneStats').innerHTML=[1,2,3,4].map(i=>{
+   const n=zoneMap[i]||0;
+   return cardRow(
+    ZONE_NAMES[i],n+' xe',
+    Math.min(100,n/15*100),''
+   );
+  }).join('');
+
+  $('modelName').textContent=' · '+
+   (data.model||'').split('/').pop();
+ }catch(e){
+  $('systemState').textContent='● Connection error';
+  renderTrafficLights(null,true);
+ }
+}
+
+function safe(s){
+ return String(s??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;',
+  '<':'&lt;',
+  '>':'&gt;',
+  '"':'&quot;',
+  "'":'&#39;'
+ }[c]));
+}
+           src="${encodeURI(e.image_url)}"
+           alt="Ảnh sự kiện">
+     </a>
+     <div class="event-info">
+      <b>${safe(e.vehicle_name)}</b>
+      <small>${safe(e.occurred_at)}</small>
+      <div><b>${e.event_type==='RED_LIGHT' ? 'VƯỢT ĐÈN ĐỎ' : e.event_type==='PARKING' ? 'ĐẬU SAI QUY ĐỊNH' : 'ĐÈ VẠCH'}</b></div>
+      <div>Camera ${e.camera} · ${e.event_type==='RED_LIGHT' ? 'Hướng' : e.event_type==='PARKING' ? 'Vùng' : 'Vạch'} ${e.line_id}</div>
+      <div>Độ tin cậy xe:
+       ${e.confidence===null
+        ? 'Chưa xác định'
+        : (e.confidence*100).toFixed(1)+'%'}
+      </div>
+      <a href="${encodeURI(e.image_url)}"
+         target="_blank" rel="noopener">
+       Xem ảnh bằng chứng
+      </a>
+     </div>
+    </article>
+   `).join('')
+   : '<p class="muted">Chưa có sự kiện nào.</p>';
+ }catch(e){
+  $('eventCount').textContent='Không tải được lịch sử';
+ }
+}
+
+reload().catch(console.error);
+
+async function clearOldEvents() {
+    if (!confirm(
+        'Bạn có chắc muốn xóa toàn bộ lỗi cũ và ảnh bằng chứng?'
+    )) return;
+
+    try {
+        const response = await fetch('/api/events/clear', {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (!response.ok || !data.ok) {
+            throw new Error(data.error || 'Xóa thất bại');
+        }
+
+        await refreshEvents();
+
+        alert('Đã xóa ' + data.deleted + ' lỗi cũ!');
+    } catch (error) {
+        alert(error.message || 'Không xóa được lịch sử');
+    }
+}
+
+renderTrafficLights(null);
+ $('espMessage').textContent=d.connected?(d.last_ack||'Đã kết nối'):(d.last_error||'Chưa có phản hồi');
+ }catch(e){$('espLed').style.color='#fb7185';$('espStatus').textContent='Lỗi máy chủ';}
+}
+async function espPing(){await fetch('/api/esp32/ping',{method:'POST'});await espPoll();}
+async function espSendTest(){
+ const r=await fetch('/api/esp32/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:$('espTest').value})});
+ setTimeout(espPoll,700);
+}
+espPoll();setInterval(espPoll,1500);
+</script>
+</body>
+</html>
