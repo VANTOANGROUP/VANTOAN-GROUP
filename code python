@@ -1,0 +1,1418 @@
+import cv2, time, json, math, threading, sqlite3, uuid, os
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from flask import Flask, Response, jsonify, request, render_template, send_from_directory
+from ultralytics import YOLO
+
+BASE = Path('/home/pi/PiServer')
+MODEL_PATH = str(BASE / 'best_ncnn_model')
+CONFIG_FILE = BASE / 'traffic_config.json'
+DB_FILE = BASE / 'traffic_events.sqlite3'
+IMAGE_DIR = BASE / 'violation_images'
+
+CAMERAS = [0, 2]
+WIDTH, HEIGHT = 640, 480
+CAMERA_FPS, WEB_FPS = 15, 10
+IMG_SIZE, CONFIDENCE = 416, 0.30
+INFER_INTERVAL = 0.35
+RESULT_TIMEOUT = 1.5
+JPEG_QUALITY = 72
+DEFAULT_LINE_WIDTH = 14
+
+WHEEL_CLASSES = {'wheel'}
+EVENT_COOLDOWN = 12.0
+TRACK_TIMEOUT = 2.0
+TRACK_MAX_DISTANCE = 95.0
+MAX_EVENTS_API = 100
+
+BASE.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+cv2.setNumThreads(1)
+
+app = Flask(__name__)
+mutex = threading.RLock()
+stop_event = threading.Event()
+
+frames = {}
+frame_seq = {c: 0 for c in CAMERAS}
+results = {}
+result_time = {}
+result_seq = {c: 0 for c in CAMERAS}
+jpeg_cache = {}
+jpeg_seq = {c: 0 for c in CAMERAS}
+status = {c: 'Starting' for c in CAMERAS}
+metrics = {}
+tracks = {c: {} for c in CAMERAS}
+next_track_id = {c: 1 for c in CAMERAS}
+last_event_for_track = {}
+last_unknown_event = {}
+last_analysis = {}
+# One event per continuous line occupancy, resilient to YOLO track-ID changes.
+violation_occupancy = {}
+red_wheel_tracks = {c: {} for c in CAMERAS}
+red_wheel_next_id = {c: 1 for c in CAMERAS}
+RED_TRACK_TIMEOUT = 1.8
+RED_MATCH_PX = 48.0
+RED_CROSS_MARGIN = 3.0
+RED_MAX_MOVE = 75.0
+OCCUPANCY_CLEAR_SECONDS = 3.0
+OCCUPANCY_MATCH_PX = 85.0
+# Canh bao ngay khi phat hien xe nam trong vung cam dau.
+# Toi thieu 15% khung bao xe giao voi da giac, hoac tam xe nam trong da giac.
+PARK_OVERLAP_THRESHOLD = 0.15
+PARK_CLEAR_SECONDS = 5.0
+PARK_SECONDS = 0.0  # Giu tuong thich voi cau hinh cu; khong con dem nguoc.
+
+
+
+# DEMO / laboratory only: ESP32 must enforce independent hardware interlocks.
+# Configure stable serial path via /dev/serial/by-id/... (recommended).
+SERIAL_PORT = os.getenv('TRAFFIC_SERIAL_PORT', '/dev/ttyUSB0')
+SERIAL_BAUD = 115200
+STATE_FILE = BASE / 'traffic_light_state.json'
+GREEN_MIN, GREEN_MAX, EQUAL_GREEN = 10, 60, 20
+YELLOW_SECONDS, ALL_RED_SECONDS = 5, 2
+MAX_CONTINUOUS_GREEN = 90   # hard fairness bound even under sustained demand
+DATA_MAX_AGE, CONTROL_TICK = 3.0, 0.1
+CHANGE_CONFIRM_SECONDS = 0.5
+# Atomic two-character frames: NS state + EW state.
+# a/s/d = NS green/yellow/red; q/w/e = EW green/yellow/red.
+COMMANDS = {('GREEN','NS'):'ae', ('YELLOW','NS'):'se',
+            ('GREEN','EW'):'dq', ('YELLOW','EW'):'dw'}
+
+def triangle(x, a, b, c):
+    if a == b and x <= b: return 1.0
+    if b == c and x >= b: return 1.0
+    if x <= a or x >= c: return 0.0
+    return (x-a)/(b-a) if x < b else (c-x)/(c-b)
+
+def fuzzify(value, maximum):
+    x = max(0., min(1., float(value)/maximum))
+    return [triangle(x,0,0,.5), triangle(x,.15,.5,.85), triangle(x,.5,1,1)]
+
+def fuzzy_green(vehicle_count, waiting_seconds):
+    # Mamdani: min implication, max aggregation, centroid defuzzification.
+    density, waiting = fuzzify(vehicle_count,30), fuzzify(waiting_seconds,90)
+    rules = [[0,0,1],[1,1,2],[2,2,2]]
+    numerator = denominator = 0.
+    for t in range(GREEN_MIN,GREEN_MAX+1):
+        output = [triangle(t,10,10,30),triangle(t,20,35,50),triangle(t,40,60,60)]
+        membership = max(min(density[i],waiting[j],output[rules[i][j]])
+                         for i in range(3) for j in range(3))
+        numerator += t*membership
+        denominator += membership
+    return max(GREEN_MIN,min(GREEN_MAX,round(numerator/denominator) if denominator else GREEN_MIN))
+
+def other(pair): return 'EW' if pair == 'NS' else 'NS'
+
+def duration_for(pair, counts, wait):
+    ns, ew = counts['1']+counts['2'], counts['3']+counts['4']
+    if ns == ew: return EQUAL_GREEN
+    return fuzzy_green(ns if pair=='NS' else ew, wait)
+
+def load_previous():
+    try:
+        old=json.loads(STATE_FILE.read_text(encoding='utf-8'))
+        return old.get('last_green') if old.get('last_green') in ('NS','EW') else None
+    except (OSError, ValueError): return None
+
+previous_green=load_previous()
+light_lock=threading.RLock()
+light_state={
+    'phase':'ALL_RED','active':None,
+    'next_phase': other(previous_green) if previous_green else 'NS',
+    'ends_at':0.,'started_at':0.,'mode':'STARTING',
+    'demand':{str(i):0 for i in range(1,5)},
+    'wait_since':{'NS':time.monotonic(),'EW':time.monotonic()},
+    'planned_green':{'NS':EQUAL_GREEN,'EW':EQUAL_GREEN},
+    'last_green':previous_green,'candidate':None,'candidate_since':0.,
+    'reason':'Startup safety clearance', 'serial':'WEB DEMO - disabled'
+}
+
+def save_last_green(pair):
+    # Store previous phase, NEVER energize a green light directly on restart.
+    try:
+        tmp=STATE_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'last_green':pair}),encoding='utf-8')
+        tmp.replace(STATE_FILE)
+    except OSError as exc: print('State persistence error:',exc,flush=True)
+
+def light_command(st): return COMMANDS.get((st['phase'],st['active']),'de')
+
+def lights_snapshot(now=None):
+    now=time.monotonic() if now is None else now
+    with light_lock:
+        st=light_state
+        remaining=max(0,math.ceil(st['ends_at']-now))
+        colors={}
+        for direction,pair in ((1,'NS'),(2,'NS'),(3,'EW'),(4,'EW')):
+            color=(st['phase'].lower() if st['active']==pair and st['phase'] in ('GREEN','YELLOW') else 'red')
+            # Red countdown = remaining current phase + pending yellow + all-red
+            # + estimated opposing green if red has to wait an additional phase.
+            if color=='red':
+                if st['phase']=='GREEN':
+                    red_seconds=remaining+YELLOW_SECONDS+ALL_RED_SECONDS
+                elif st['phase']=='YELLOW': red_seconds=remaining+ALL_RED_SECONDS
+                else: red_seconds=remaining
+                if st['phase']=='ALL_RED' and st['next_phase']!=pair:
+                    red_seconds+=st['planned_green'][st['next_phase']]+YELLOW_SECONDS+ALL_RED_SECONDS
+                elif st['phase'] in ('GREEN','YELLOW') and st['active']==pair:
+                    red_seconds=0
+                if st['phase'] in ('GREEN','YELLOW') and st['active']!=pair:
+                    pass
+                remaining_for_direction=red_seconds
+            else: remaining_for_direction=remaining
+            colors[str(direction)]={'color':color,'remaining':remaining_for_direction}
+        return {'lights':colors,'light_control':{
+            'mode':st['mode'],'phase':st['phase'],'active':st['active'],
+            'next_phase':st['next_phase'],'remaining':remaining,
+            'demand':dict(st['demand']),'planned_green':dict(st['planned_green']),
+            'command':light_command(st),'serial':st['serial'],
+            'reason':st['reason'],'last_green':st['last_green']}}
+
+def traffic_controller():
+    """Stable fixed-at-start green duration; minimum green and fair alternation."""
+    while not stop_event.is_set():
+        now = time.monotonic()
+        with mutex:
+            fresh = all(status[c] == 'Online' and c in last_analysis and
+                        now - result_time.get(c, -1e9) <= DATA_MAX_AGE
+                        for c in CAMERAS)
+            counts = {str(i): 0 for i in range(1, 5)}
+            if fresh:
+                for cid in CAMERAS:
+                    for direction, n in last_analysis[cid]['zones'].items():
+                        counts[str(direction)] += int(n)
+        with light_lock:
+            st = light_state
+            st['demand'] = counts
+            if not fresh:
+                if st['mode'] != 'FAILSAFE_ALL_RED':
+                    st['phase'], st['active'] = 'ALL_RED', None
+                    st['ends_at'] = now + ALL_RED_SECONDS
+                st['mode'] = 'FAILSAFE_ALL_RED'
+                st['candidate'] = None
+                st['reason'] = 'Camera/AI data stale; simulated all red'
+            else:
+                recovering = st['mode'] != 'FUZZY'
+                st['mode'] = 'FUZZY'
+                ns, ew = counts['1'] + counts['2'], counts['3'] + counts['4']
+                for pair in ('NS', 'EW'):
+                    st['planned_green'][pair] = duration_for(pair, counts, now-st['wait_since'][pair])
+                if recovering:
+                    st['phase'], st['active'] = 'ALL_RED', None
+                    st['ends_at'] = now + ALL_RED_SECONDS
+                    st['reason'] = 'Recovery safety clearance'
+                elif st['phase'] == 'ALL_RED' and now >= st['ends_at']:
+                    pair = st['next_phase']
+                    st['phase'], st['active'] = 'GREEN', pair
+                    st['started_at'] = now
+                    duration = max(GREEN_MIN, min(GREEN_MAX, duration_for(pair, counts, now-st['wait_since'][pair])))
+                    st['ends_at'] = now + duration
+                    st['last_green'] = pair
+                    st['wait_since'][pair] = now
+                    st['next_phase'] = other(pair)
+                    st['candidate'] = None
+                    st['reason'] = 'Green phase locked for stable countdown'
+                    save_last_green(pair)
+                elif st['phase'] == 'YELLOW' and now >= st['ends_at']:
+                    st['phase'], st['active'] = 'ALL_RED', None
+                    st['ends_at'] = now + ALL_RED_SECONDS
+                    st['reason'] = 'Yellow completed; all-red clearance'
+                elif st['phase'] == 'GREEN':
+                    active = st['active']
+                    own, opp = (ns, ew) if active == 'NS' else (ew, ns)
+                    elapsed = now-st['started_at']
+                    if elapsed >= GREEN_MIN and opp >= own + max(3, int(own*.25)):
+                        if st['candidate'] != other(active):
+                            st['candidate'] = other(active)
+                            st['candidate_since'] = now
+                    else:
+                        st['candidate'] = None
+                    early_switch = (st['candidate'] is not None and
+                                    now-st['candidate_since'] >= 2.0)
+                    if now >= st['ends_at'] or elapsed >= MAX_CONTINUOUS_GREEN or early_switch:
+                        st['phase'] = 'YELLOW'
+                        st['ends_at'] = now + YELLOW_SECONDS
+                        st['next_phase'] = other(active)
+                        st['candidate'] = None
+                        st['reason'] = 'Green complete; protected yellow transition'
+        stop_event.wait(CONTROL_TICK)
+
+
+serial_state = {'connected': False, 'last_ack': '', 'last_error': '', 'port': SERIAL_PORT,
+                'last_pong': 0, 'last_seen': 0}
+serial_lock = threading.RLock()
+manual_test = {'command': None, 'until': 0.0}
+TEST_COMMANDS = {'ae','se','de','dq','dw'}
+ping_requested = threading.Event()
+
+def serial_worker():
+    try:
+        import serial
+    except ImportError:
+        with serial_lock:
+            serial_state['last_error'] = 'Cai pyserial: pip install pyserial'
+        return
+    while not stop_event.is_set():
+        try:
+            with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=.25, write_timeout=.4) as port:
+                stop_event.wait(2.5)  # ESP32 reset on opening USB
+                port.reset_input_buffer()
+                last_ping = 0.0
+                while not stop_event.is_set():
+                    now = time.monotonic()
+                    do_ping = ping_requested.is_set() or now-last_ping >= 2.0
+                    if do_ping:
+                        ping_requested.clear()
+                        port.write(b'PING\n')
+                        port.flush()
+                        deadline = time.monotonic() + 0.8
+                        pong = False
+                        while time.monotonic() < deadline:
+                            line = port.readline().decode('ascii',errors='replace').strip()
+                            if line == 'PONG':
+                                pong = True
+                                break
+                        last_ping = time.monotonic()
+                        with serial_lock:
+                            serial_state['connected'] = pong
+                            if pong:
+                                serial_state.update(last_pong=time.time(),last_seen=time.time(),last_error='')
+                            else:
+                                serial_state['last_error'] = 'ESP32 khong tra loi PING'
+                    with serial_lock:
+                        test = manual_test['command'] if now < manual_test['until'] else None
+                    with light_lock:
+                        cmd = test or light_command(light_state)
+                    port.write((cmd+'\n').encode('ascii'))
+                    port.flush()
+                    deadline = time.monotonic()+0.8
+                    response = ''
+                    while time.monotonic() < deadline:
+                        line = port.readline().decode('ascii',errors='replace').strip()
+                        if line == 'ACK '+cmd:
+                            response = line
+                            break
+                        if line.startswith('ERR'):
+                            response = line
+                            break
+                    with serial_lock:
+                        if response == 'ACK '+cmd:
+                            serial_state.update(connected=True,last_ack=response,last_seen=time.time(),last_error='')
+                        elif response:
+                            serial_state['last_error'] = response
+                        elif not serial_state['connected']:
+                            serial_state['last_error'] = 'Khong nhan ACK'
+                    stop_event.wait(.35)
+        except Exception as exc:
+            with serial_lock:
+                serial_state['connected'] = False
+                serial_state['last_error'] = str(exc)
+            stop_event.wait(2)
+
+@app.get('/api/esp32/status')
+def esp32_status():
+    with serial_lock:
+        result = dict(serial_state)
+    if result['last_seen'] and time.time()-result['last_seen'] > 4:
+        result['connected'] = False
+    return jsonify(result)
+
+@app.post('/api/esp32/test')
+def esp32_test():
+    cmd = (request.get_json(silent=True) or {}).get('command')
+    if cmd not in TEST_COMMANDS:
+        return jsonify(ok=False,error='Invalid test command'),400
+    with serial_lock:
+        manual_test['command'] = cmd
+        manual_test['until'] = time.monotonic()+5.0
+    return jsonify(ok=True,command=cmd,seconds=5)
+
+@app.post('/api/esp32/ping')
+def esp32_ping():
+    ping_requested.set()
+    with serial_lock:
+        return jsonify(ok=True, message='Da yeu cau PING; kiem tra /api/esp32/status')
+
+
+def is_vehicle(name):
+    # Model hien tai co ID1, ID27... va wheel.
+    return name.lower().startswith('id')
+
+
+def db_connect():
+    con = sqlite3.connect(DB_FILE, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with db_connect() as con:
+        con.execute('''
+            CREATE TABLE IF NOT EXISTS violations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at TEXT NOT NULL,
+                camera INTEGER NOT NULL,
+                line_id INTEGER NOT NULL,
+                vehicle_name TEXT NOT NULL,
+                confidence REAL,
+                image_file TEXT NOT NULL,
+                track_id INTEGER,
+                note TEXT NOT NULL
+            )
+        ''')
+        con.execute(
+            'CREATE INDEX IF NOT EXISTS idx_violation_time '
+            'ON violations(id DESC)'
+        )
+
+
+def default_config():
+    return {
+        'zones': [
+            {'id': i, 'camera': 0, 'points': []}
+            for i in range(1, 5)
+        ],
+        'lines': [
+            {'id': i, 'camera': 0, 'points': [],
+             'width': DEFAULT_LINE_WIDTH}
+            for i in range(1, 5)
+        ],
+        'parking_zones': [
+            {'id': i, 'camera': 0, 'points': [], 'seconds': PARK_SECONDS}
+            for i in range(1, 5)
+        ],
+        'red_lines': [
+            {'id': i, 'camera': 0, 'points': [], 'width': DEFAULT_LINE_WIDTH}
+            for i in range(1, 5)
+        ]
+    }
+
+
+def load_config():
+    cfg = default_config()
+    if CONFIG_FILE.exists():
+        try:
+            old = json.loads(
+                CONFIG_FILE.read_text(encoding='utf-8')
+            )
+            for kind in ('zones', 'lines', 'red_lines', 'parking_zones'):
+                for item in old.get(kind, []):
+                    i = item.get('id')
+                    if type(i) is int and 1 <= i <= 4:
+                        cfg[kind][i-1].update(item)
+        except Exception as e:
+            print('Config error:', e)
+    return cfg
+
+
+config = load_config()
+
+
+def save_config():
+    temp = CONFIG_FILE.with_suffix('.tmp')
+    temp.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False),
+        encoding='utf-8'
+    )
+    temp.replace(CONFIG_FILE)
+
+
+def pixel_points(points):
+    return np.array(
+        [[round(p[0]*WIDTH), round(p[1]*HEIGHT)]
+         for p in points],
+        dtype=np.int32
+    )
+
+
+def point_in_zone(point, points):
+    return (
+        len(points) >= 3 and
+        cv2.pointPolygonTest(
+            pixel_points(points), point, False
+        ) >= 0
+    )
+
+
+def vehicle_in_parking_zone(box, polygon, mask):
+    """Xe nam trong vung neu tam xe o trong vung HOAC giao >= 15% bbox.
+
+    Co the phat hien xe chi cat mot phan vung cam dau, khong can nhan dien banh.
+    """
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1, y1 = max(0, min(WIDTH, x1)), max(0, min(HEIGHT, y1))
+    x2, y2 = max(0, min(WIDTH, x2)), max(0, min(HEIGHT, y2))
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    if cv2.pointPolygonTest(polygon, center, False) >= 0:
+        return True
+
+    overlap = cv2.countNonZero(mask[y1:y2, x1:x2])
+    return overlap / ((x2 - x1) * (y2 - y1)) >= PARK_OVERLAP_THRESHOLD
+
+
+def distance_to_segment(point, a, b):
+    p = np.array(point, dtype=float)
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    v = b-a
+    t = np.clip(
+        np.dot(p-a, v) /
+        max(float(np.dot(v, v)), 1e-9),
+        0, 1
+    )
+    return float(np.linalg.norm(p-(a+t*v)))
+
+
+def wheel_on_line(center, line):
+    if len(line['points']) != 2:
+        return False
+    a, b = pixel_points(line['points'])
+    return (
+        distance_to_segment(center, a, b)
+        <= float(line['width']) / 2
+    )
+
+
+def associate_vehicle(center, vehicles):
+    px, py = center
+    candidates = []
+    for i, v in enumerate(vehicles):
+        x1, y1, x2, y2 = v['box']
+        if (
+            x1-10 <= px <= x2+10 and
+            y1-10 <= py <= y2+10
+        ):
+            area = max(1, (x2-x1)*(y2-y1))
+            candidates.append((area, i))
+    return min(candidates)[1] if candidates else None
+
+
+def camera_worker(cid):
+    while not stop_event.is_set():
+        cap = cv2.VideoCapture(cid, cv2.CAP_V4L2)
+        cap.set(
+            cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(*'MJPG')
+        )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            with mutex:
+                status[cid] = 'Disconnected'
+            cap.release()
+            stop_event.wait(2)
+            continue
+
+        with mutex:
+            status[cid] = 'Online'
+
+        while not stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            if (frame.shape[1], frame.shape[0]) != (WIDTH, HEIGHT):
+                frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+            with mutex:
+                frames[cid] = frame
+                frame_seq[cid] += 1
+
+        cap.release()
+        with mutex:
+            status[cid] = 'Reconnecting'
+        stop_event.wait(1)
+
+
+def analyze(cid, objects, cfg):
+    vehicles = [
+        o for o in objects if is_vehicle(o['name'])
+    ]
+    wheels = [
+        o for o in objects if o['name'] in WHEEL_CLASSES
+    ]
+
+    zone_counts, line_counts = {}, {}
+    hits = []
+    hit_vehicles, hit_wheels = set(), set()
+    parking_hits = []
+    parking_vehicles = set()
+    parking_counts = {}
+
+    # Phat hien xe trong vung cam dau, khong can banh xe va khong cho 30 giay.
+    for zone in cfg.get('parking_zones', []):
+        if zone['camera'] != cid or len(zone['points']) < 3:
+            continue
+        polygon = pixel_points(zone['points'])
+        mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon], 255)
+        found = 0
+        for vi, vehicle in enumerate(vehicles):
+            if not vehicle_in_parking_zone(vehicle['box'], polygon, mask):
+                continue
+            x1, y1, x2, y2 = vehicle['box']
+            center = ((x1+x2)/2.0, (y1+y2)/2.0)
+            parking_hits.append({
+                'line_id': zone['id'],
+                'vehicle_index': vi,
+                'wheel_index': None,
+                'center': center,
+            })
+            parking_vehicles.add(vi)
+            found += 1
+        parking_counts[zone['id']] = found
+
+    for z in cfg['zones']:
+        if z['camera'] != cid:
+            continue
+
+        zone_counts[z['id']] = sum(
+            point_in_zone(
+                (
+                    (v['box'][0]+v['box'][2])//2,
+                    v['box'][3]
+                ),
+                z['points']
+            )
+            for v in vehicles
+        )
+
+    for line in cfg['lines']:
+        if line['camera'] != cid:
+            continue
+
+        lv, lw = set(), set()
+
+        if len(line['points']) == 2:
+            for wi, wheel in enumerate(wheels):
+                x1, y1, x2, y2 = wheel['box']
+                center = (
+                    (x1+x2)//2,
+                    (y1+y2)//2
+                )
+
+                if not wheel_on_line(center, line):
+                    continue
+
+                vi = associate_vehicle(center, vehicles)
+
+                hits.append({
+                    'line_id': line['id'],
+                    'wheel_index': wi,
+                    'vehicle_index': vi,
+                    'center': center
+                })
+
+                lw.add(wi)
+                hit_wheels.add(wi)
+
+                if vi is not None:
+                    lv.add(vi)
+                    hit_vehicles.add(vi)
+
+        line_counts[line['id']] = {
+            'wheels': len(lw),
+            'vehicles': len(lv)
+        }
+
+    return dict(
+        vehicles=vehicles,
+        wheels=wheels,
+        zones=zone_counts,
+        lines=line_counts,
+        hits=hits,
+        hit_vehicles=hit_vehicles,
+        hit_wheels=hit_wheels,
+        line_alert=bool(hits),
+        parking_hits=parking_hits,
+        parking_vehicles=parking_vehicles,
+        parking_counts=parking_counts,
+        parking_alert=bool(parking_hits)
+    )
+
+
+def check_parking(cid, data, track_ids, cfg, now, image):
+    """Bao loi ngay khi xe xuat hien trong vung cam dau.
+
+    save_event/occupancy_candidate gop cac ket qua cua cung mot xe de
+    tranh luu anh trung lap lien tuc trong khi xe van nam trong vung.
+    """
+    for hit in data.get('parking_hits', []):
+        save_event(cid, hit, data, track_ids, image, now, event_type='PARKING')
+
+
+def assign_tracks(cid, vehicles, now):
+    active = tracks[cid]
+    used = set()
+    assigned = {}
+
+    for i, v in enumerate(vehicles):
+        x1, y1, x2, y2 = v['box']
+        center = (
+            (x1+x2)/2,
+            (y1+y2)/2
+        )
+
+        best, distance = None, TRACK_MAX_DISTANCE
+
+        for tid, tr in active.items():
+            if (
+                tid in used or
+                tr['name'] != v['name'] or
+                now-tr['last'] > TRACK_TIMEOUT
+            ):
+                continue
+
+            d = math.dist(center, tr['center'])
+            if d < distance:
+                best, distance = tid, d
+
+        if best is None:
+            best = next_track_id[cid]
+            next_track_id[cid] += 1
+
+        active[best] = {
+            'name': v['name'],
+            'center': center,
+            'last': now
+        }
+
+        used.add(best)
+        assigned[i] = best
+
+    for tid in list(active):
+        if now-active[tid]['last'] > TRACK_TIMEOUT:
+            del active[tid]
+
+    return assigned
+
+
+def draw_scene(image, cid, data, cfg):
+    for z in cfg['zones']:
+        if z['camera'] != cid or len(z['points']) < 3:
+            continue
+
+        poly = pixel_points(z['points'])
+        cv2.polylines(
+            image, [poly], True,
+            (0, 165, 255), 2
+        )
+
+        x, y = poly[0]
+        ten_huong = {
+            1: "BAC",
+            2: "NAM",
+            3: "DONG",
+            4: "TAY",
+        }
+
+        cv2.putText(
+            image,
+            f"{ten_huong.get(z['id'], 'VUNG')}: {data['zones'].get(z['id'], 0)}",
+            (int(x), max(20, int(y)-8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .52, (0, 255, 255), 2
+        )
+
+    for zone in cfg.get('parking_zones', []):
+        if zone['camera'] == cid and len(zone['points']) >= 3:
+            poly = pixel_points(zone['points'])
+            cv2.polylines(image, [poly], True, (255, 0, 255), 2)
+            x,y = poly[0]
+            count = data.get('parking_counts', {}).get(zone['id'], 0)
+            cv2.putText(image, f'CAM DAU {zone["id"]}: {count} XE',
+                        (int(x), max(20,int(y)-8)), cv2.FONT_HERSHEY_SIMPLEX,
+                        .48, (255,0,255), 2)
+
+    for line in cfg['lines']:
+        if line['camera'] != cid or len(line['points']) != 2:
+            continue
+
+        a, b = pixel_points(line['points'])
+        cv2.line(
+            image, tuple(a), tuple(b),
+            (0, 0, 200), max(1, int(line['width']))
+        )
+        cv2.line(
+            image, tuple(a), tuple(b),
+            (255, 255, 255), 2
+        )
+
+    # Separate stop lines for red-light crossing, direction = line ID.
+    for line in cfg.get('red_lines', []):
+        if line['camera'] != cid or len(line['points']) != 2:
+            continue
+        a, b = pixel_points(line['points'])
+        cv2.line(image, tuple(a), tuple(b), (180, 0, 255), 3)
+        cv2.putText(image, f"STOP {line['id']}",
+                    (int(a[0]), max(20, int(a[1])-8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, .55, (180, 0, 255), 2)
+
+    for i, v in enumerate(data['vehicles']):
+        x1, y1, x2, y2 = v['box']
+        hit = i in data['hit_vehicles']
+        parking = i in data.get('parking_vehicles', set())
+        color = (0, 0, 255) if hit or parking else (0, 220, 50)
+
+        cv2.rectangle(
+            image, (x1, y1), (x2, y2), color, 2
+        )
+
+        label = v['name']
+        if parking:
+            label += ' | DAU SAI QUY DINH'
+        elif hit:
+            label += ' | DE VACH'
+
+        cv2.putText(
+            image, label,
+            (x1, max(16, y1-6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .45, color, 2
+        )
+
+    for i, w in enumerate(data['wheels']):
+        x1, y1, x2, y2 = w['box']
+        color = (
+            (0, 0, 255)
+            if i in data['hit_wheels']
+            else (255, 100, 0)
+        )
+
+        cv2.rectangle(
+            image, (x1, y1), (x2, y2), color, 2
+        )
+
+        cv2.circle(
+            image,
+            ((x1+x2)//2, (y1+y2)//2),
+            4, (0, 255, 255), -1
+        )
+
+        cv2.putText(
+            image,
+            f"wheel {w['confidence']:.2f}",
+            (x1, max(16, y1-5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .4, color, 1
+        )
+
+    if data['line_alert']:
+        cv2.rectangle(
+            image, (0, 0), (WIDTH-1, 52),
+            (0, 0, 190), -1
+        )
+        cv2.putText(
+            image, 'CANH BAO: XE DE VACH!',
+            (12, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .75, (255, 255, 255), 2
+        )
+
+    if data.get('parking_alert'):
+        top = 54 if data['line_alert'] else 0
+        cv2.rectangle(image, (0, top), (WIDTH-1, top+52), (0, 0, 190), -1)
+        cv2.putText(image, 'CANH BAO: DAU XE SAI QUY DINH!',
+                    (12, top+34), cv2.FONT_HERSHEY_SIMPLEX,
+                    .70, (255, 255, 255), 2)
+
+    cv2.putText(
+        image,
+        f"CAM {cid} | XE: {len(data['vehicles'])} "
+        f"| BANH: {len(data['wheels'])}",
+        (10, HEIGHT-12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        .5, (255, 255, 255), 2
+    )
+    return image
+
+
+def occupancy_candidate(cid, hit, track_ids, now, event_type="LINE"):
+    """Return a new slot or None if this wheel is already in an active event."""
+    line_id = hit['line_id']
+    center = tuple(hit['center'])
+    vi = hit['vehicle_index']
+    tid = track_ids.get(vi) if vi is not None else None
+    slots = violation_occupancy.setdefault((cid, event_type, line_id), [])
+    ttl = PARK_CLEAR_SECONDS if event_type == 'PARKING' else OCCUPANCY_CLEAR_SECONDS
+    slots[:] = [slot for slot in slots if now - slot['last_seen'] <= ttl]
+    for slot in slots:
+        same_track = tid is not None and slot['tid'] == tid
+        distance = math.dist(center, slot['center'])
+        if event_type == 'PARKING':
+            # Han che hai xe gan nhau bi tinh la mot xe.
+            # Van chap nhan sai lech track ID neu xe gan nhu dung yen.
+            nearby = (distance <= 20 or
+                      (distance <= 45 and (tid is None or slot['tid'] is None)))
+        else:
+            nearby = distance <= OCCUPANCY_MATCH_PX
+        if same_track or nearby:
+            slot['center'] = center
+            slot['last_seen'] = now
+            if tid is not None:
+                slot['tid'] = tid
+            return None
+    return {'center': center, 'last_seen': now, 'tid': tid}
+
+
+def save_event(cid, hit, data, track_ids, image, now, event_type="LINE"):
+    vi = hit['vehicle_index']
+    line_id = hit['line_id']
+
+    if vi is None:
+        vehicle_name = 'Chua xac dinh'
+        confidence = None
+        tid = None
+        key = ('unknown', cid, line_id)
+        last = last_unknown_event.get(key, -1e9)
+    else:
+        v = data['vehicles'][vi]
+        vehicle_name = v['name']
+        confidence = v['confidence']
+        tid = track_ids.get(vi)
+        key = (cid, tid, line_id)
+        last = last_event_for_track.get(key, -1e9)
+
+    # Suppress repeat captures until the wheel has been absent for a while.
+    slot = occupancy_candidate(cid, hit, track_ids, now, event_type)
+    if slot is None:
+        return False
+
+    is_red = event_type == 'RED_LIGHT'
+    is_parking = event_type == 'PARKING'
+    label = 'VUOT DEN DO' if is_red else ('DAU SAI QUY DINH' if is_parking else 'DE VACH')
+    note = (f'Vuot den do - huong {line_id}' if is_red
+            else (f'Dau sai quy dinh - vung {line_id}' if is_parking
+                  else 'Canh bao AI: tam banh xe nam trong vung vach'))
+    event_key = uuid.uuid4().hex
+    filename = (
+        f"cam{cid}_line{line_id}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_"
+        f"{event_key[:8]}.jpg"
+    )
+
+    path = IMAGE_DIR / filename
+    annotated = image.copy()
+
+    cv2.putText(
+        annotated,
+        f"XE: {vehicle_name} | {label}: {line_id}",
+        (10, min(HEIGHT-36, 76)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        .52, (0, 0, 255), 2
+    )
+
+    if not cv2.imwrite(
+        str(path), annotated,
+        [cv2.IMWRITE_JPEG_QUALITY, 88]
+    ):
+        print('Cannot save evidence:', path)
+        return
+
+    occurred_at = (
+        datetime.now()
+        .astimezone()
+        .isoformat(timespec='seconds')
+    )
+
+    try:
+        with db_connect() as con:
+            con.execute('''
+                INSERT INTO violations
+                (
+                    event_key, occurred_at, camera,
+                    line_id, vehicle_name, confidence,
+                    image_file, track_id, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                event_key, occurred_at, cid,
+                line_id, vehicle_name, confidence,
+                filename, tid,
+                note
+            ))
+    except Exception as e:
+        print('DB error:', e)
+        path.unlink(missing_ok=True)
+        return
+
+    violation_occupancy.setdefault((cid, event_type, line_id), []).append(slot)
+
+    print(
+        f"[VI PHAM] {occurred_at} CAM={cid} "
+        f"LINE={line_id} XE={vehicle_name} IMG={filename}",
+        flush=True
+    )
+    return True
+
+
+def signed_side(point, a, b):
+    dx, dy = float(b[0]-a[0]), float(b[1]-a[1])
+    length = math.hypot(dx, dy)
+    if length < 1: return 0.0
+    return (dx*(point[1]-a[1]) - dy*(point[0]-a[0])) / length
+
+
+def crosses_finite_segment(previous, current, a, b):
+    # Intersection of motion segment with finite stop line.
+    px, py = previous
+    rx, ry = current[0]-px, current[1]-py
+    ax, ay = float(a[0]), float(a[1])
+    sx, sy = float(b[0]-a[0]), float(b[1]-a[1])
+    denom = rx*sy - ry*sx
+    if abs(denom) < 1e-6: return False
+    qx, qy = ax-px, ay-py
+    t = (qx*sy-qy*sx)/denom
+    u = (qx*ry-qy*rx)/denom
+    return 0 <= t <= 1 and 0 <= u <= 1
+
+
+def detect_red_crossings(cid, data, track_ids, cfg, now):
+    """Demo: tam banh xe cham vach dung khi den do thi ghi nhan.
+
+    Chup trung duoc loc boi occupancy_candidate() trong save_event().
+    """
+    with light_lock:
+        phase = light_state['phase']
+        active_pair = light_state['active']
+        mode = light_state['mode']
+
+    if mode != 'FUZZY':
+        return []
+
+    events = []
+    for line in cfg.get('red_lines', []):
+        if line['camera'] != cid or len(line['points']) != 2:
+            continue
+
+        direction = line['id']
+        pair = 'NS' if direction in (1, 2) else 'EW'
+        red_now = (phase == 'ALL_RED') or (
+            phase in ('GREEN', 'YELLOW') and active_pair != pair
+        )
+        if not red_now:
+            continue
+
+     wheel['box']
+            center = ((x1 + x2) / 2, (y1 + y2) / 2)
+            if distance_to_segment(center, a, b) > width / 2:
+                continue
+
+            vi = associate_vehicle(center, data['vehicles'])
+            if vi is None:
+                continue
+
+            events.append(dict(
+                line_id=direction,
+                vehicle_index=vi,
+                wheel_index=wi,
+                center=center,
+                direction=direction
+            ))
+    return events
+
+
+def ai_worker():
+    try:
+        model = YOLO(MODEL_PATH, task='detect')
+        print('MODEL READY:', model.names, flush=True)
+    except Exception as e:
+        
+            for cid in CAMERAS:
+                status[cid] = 'Model error'
+        return
+
+    last_infer = {c: 0 for c in CAMERAS}
+    last_frame = {c: -1 for c in CAMERAS}
+
+    while not stop_event.is_set():
+        worked = False
+
+        for cid in CAMERAS:
+            with mutex:
+                f = frames.get(cid)
+                seq = frame_seq[cid]
+                cfg = json.loads(json.dumps(config))
+
+            if f is None or seq == last_frame[cid]:
+                continue
+
+            if time.monotonic()-last_infer[cid] < INFER_INTERVAL:
+                continue
+
+            worked = True
+            last_frame[cid] = seq
+            last_infer[cid] = time.monotonic()
+            image = f.copy()
+
+            try:
+                pred = model.predict(
+                    image,
+                    imgsz=IMG_SIZE,
+                    conf=CONFIDENCE,
+                    verbose=False
+                )[0]
+
+                detected = []
+
+                for box in pred.boxes:
+                    cls = int(box.cls[0].item())
+                    detected.append({
+                        'name': str(pred.names[cls]).lower(),
+                        'box': list(map(
+                            int, box.xyxy[0].tolist()
+                        )),
+                        'confidence': float(
+                            box.conf[0].item()
+                        )
+                    })
+
+                now = time.monotonic()
+                data = analyze(cid, detected, cfg)
+                track_ids = assign_tracks(
+                    cid, data['vehicles'], now
+                )
+
+                annotated = draw_scene(
+                    image.copy(), cid, data, cfg
+                )
+
+                unique_hits = {}
+
+                    unique_hits[key] = hit
+
+                for hit in unique_hits.values():
+                    save_event(
+                        cid, hit, data,
+                        track_ids, annotated, now
+                    )
+
+                check_parking(cid, data, track_ids, cfg, now, annotated)
+
+                # Detect crossing only after associating wheel and vehicle.
+                red_hits = detect_red_crossings(cid, data, track_ids, cfg, now)
+                for hit in red_hits:
+                    save_event(cid, hit, data, track_ids,
+                               annotated, now, event_type='RED_LIGHT')
+
+                with mutex:
+                    results[cid] = detected
+                    result_time[cid] = now
+                    result_seq[cid] += 1
+                    last_analysis[cid] = data
+
+            except Exception as e:
+                print(
+                    'YOLO error:', cid, e,
+                    flush=True
+                )
+                stop_event.wait(.2)
+
+        if not worked:
+            stop_event.wait(.02)
+
+
+def render_worker(cid):
+    period = 1 / WEB_FPS
+
+    while not stop_event.is_set():
+        started = time.monotonic()
+
+        with mutex:
+            frame = frames.get(cid)
+            data = last_analysis.get(cid)
+            stamp = result_time.get(cid, 0)
+            cfg = json.loads(json.dumps(config))
+            current_status = status[cid]
+
+        if frame is None:
+            stop_event.wait(.1)
+            continue
+
+        age = started-stamp if stamp else 999
+
+        if age > RESULT_TIMEOUT or data is None:
+            data = analyze(cid, [], cfg)
+
+        image = draw_scene(
+            frame.copy(), cid, data, cfg
+        )
+
+        ok, buf = cv2.imencode(
+            '.jpg', image,
+            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+        )
+
+        with mutex:
+            metrics[cid] = {
+                'vehicles': len(data['vehicles']),
+                'wheels'king_alert'],
+                'parking_counts': data['parking_counts'],
+                'zones': data['zones'],
+                'lines': data['lines'],
+                'status': current_status,
+                'ai_age': round(age, 2) if stamp else None
+            }
+
+            if ok:
+                jpeg_cache[cid] = buf.tobytes()
+                jpeg_seq[cid] += 1
+
+        stop_event.wait(
+            max(.01, period-(time.monotonic()-started))
+        )
+
+
+@app.get('/')
+def index():
+    return render_template('index.html')
+
+
+@app.get('/video/<int:cid>')
+def video(cid):
+    if cid not in CAMERAS:
+        return 'Invalid camera', 404
+
+    def stream():
+        last = -1
+
+        while not stop_event.is_set():
+            with mutex:
+                seq = jpeg_seq[cid]
+                jpg = jpeg_cache.get(cid)
+
+            if jpg is not None and seq != last:
+                last = seq
+                yield (
+                    b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n'
+                    + jpg + b'\r\n'
+                )
+
+            stop_event.wait(1/WEB_FPS)
+
+    return Response(
+        stream(),
+        mimetype=(
+            'multipart/x-mixed-replace; boundary=frame'
+        )
+    )
+
+
+@app.get('/api/status')
+def api_status():
+    with mutex:
+        return jsonify({
+            'cameras': metrics,
+            'model': MODEL_PATH,
+            'time': time.time(),
+            **lights_snapshot()
+        })
+
+
+@app.get('/api/config')
+def api_config():
+    with mutex:
+        return jsonify(config)
+
+
+@app.post('/api/config/<kind>/<int:idx>')
+nes', 'lines', 'red_lines', 'parking_zones') or not 1 <= idx <= 4:
+        return jsonify(error='Invalid selection'), 400
+
+    width = data.get('width', DEFAULT_LINE_WIDTH)
+    seconds = data.get('seconds', PARK_SECONDS)
+
+    if type(cid) is not int or cid not in CAMERAS:
+        return jsonify(error='Invalid camera'), 400
+
+    valid_count = (
+        isinstance(pts, list) and
+        (
+            len(pts) == 2 if kind in ('lines', 'red_lines')
+            else 3 <= len(pts) <= 30
+        )
+    )
+
+    if not valid_count:
+        return jsonify(error='Invalid points'), 400
+
+    for p in pts:
+        if (
+            not isinstance(p, list) or
+            len(p) != 2 or
+            any(
+                type(v) not in (int, float) or
+                not math.isfinite(v) or
+                not 0 <= v <= 1
+                for v in p
+            )
+        ):
+            return jsonify(error='Invalid coordinates'), 400
+
+    if (
+        type(width) not in (int, float) or
+        not math.isfinite(width) or
+        not 2 <= width <= 100
+    ):
+        return jsonify(error='Invalid width'), 400
+
+    # Canh bao cam dau ngay, khong can cau hinh so giay cho.
+
+    with mutex:
+        item = config[kind][idx-1]
+        item['camera'] = cid
+        item['points'] = pts
+
+        if kind in ('lines', 'red_lines'):
+            item['width'] = width
+        if kind == 'parking_zones':
+            item['seconds'] = 0
+            for occupancy_key in list(violation_occupancy):
+                if occupancy_key[1] == 'PARKING' and occupancy_key[2] == idx:
+                    del violation_occupancy[occupancy_key]
+
+        save_config()
+
+    return jsonify(ok=True)
+
+
+@app.get('/api/events')
+def api_events():
+    limit = request.args.get('limit', 30, type=int)
+    limit = max(1, min(MAX_EVENTS_API, limit))
+
+    with db_connect() as con:
+        rows = con.execute(
+            'SELECT * FROM violations '
+            'ORDER BY id DESC LIMIT ?',
+            (limit,)
+        ).fetchall()
+        total = con.execute(
+            'SELECT COUNT(*) FROM violations'
+        ).fetchone()[0]
+
+    events = []
+
+    for row in rows:
+        item = dict(row)
+        item['event_type'] = ('RED_LIGHT' if item['note'].startswith('Vuot den do') else ('PARKING' if item['note'].startswith('Dau sai quy dinh') else 'LINE'))
+        item['image_url'] = (
+            '/evidence/' + item.pop('image_file')
+        )
+        events.append(item)
+
+    return jsonify({
+        'events': events,
+        'total': total
+    })
+
+
+@app.get('/evidence/<path:filename>')
+def evidence(filename):
+    return send_from_directory(
+        str(IMAGE_DIR), filename
+    )
+
+# API XOA TOAN BO LICH SU VI PHAM VA ANH CU
+@app.post('/api/events/clear')
+def api_clear_events():
+    try:
+        # Lay danh sach anh va xoa lich su trong SQLite
+        with db_connect() as con:
+            rows = con.execute(
+                'SELECT image_file FROM violations'
+            ).fetchall()
+
+            deleted = con.execute(
+                'DELETE FROM violations'
+            ).rowcount
+
+            con.commit()
+
+        # Xoa anh bang chung da luu
+        images_deleted = 0
+        images_failed = 0
+
+        for row in rows:
+            filename = Path(row['image_file']).name
+            image_path = IMAGE_DIR / filename
+
+            try:
+                if image_path.is_file():
+                    image_path.unlink()
+                    images_deleted += 1
+            except OSError as e:
+                images_failed += 1
+                print('Loi xoa anh:', e)
+
+        print(
+            f'DA XOA {deleted} SU KIEN, '
+            f'{images_deleted} ANH',
+            flush=True
+        )
+
+        return jsonify({
+            'ok': True,
+            'deleted': deleted,
+            'images_deleted': images_deleted,
+            'images_failed': images_failed
+        })
+
+    except Exception as e:
+        print('LOI XOA LICH SU:', e, flush=True)
+        return jsonify({
+            'ok': False,
+            'error': str(e)
+        }), 500
+
+
+if __name__ == '__main__':
+    init_db()
+
+    print(
+        'TRAFFIC AI CONTROL | MODEL:',
+        MODEL_PATH,
+        flush=True
+    )
+
+    for cid in CAMERAS:
+        threading.Thread(
+            target=camera_worker,
+            args=(cid,),
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=render_worker,
+            args=(cid,),
+            daemon=True
+        ).start()
+
+    threading.Thread(target=traffic_controller, daemon=True).start()
+    threading.Thread(target=serial_worker, daemon=True).start()
+
+    threading.Thread(
+        target=ai_worker,
+        daemon=True
+    ).start()
+
+    try:
+        app.run(
+            host='0.0.0.0',
+            port=8080,
+            threaded=True,
+            use_reloader=False
+        )
+    finally:
+        stop_event.set()
